@@ -11,6 +11,8 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'home_screen.dart';
+
 class StationaryVehicleDetectionPage extends StatefulWidget {
   const StationaryVehicleDetectionPage({super.key});
 
@@ -29,18 +31,20 @@ class _StationaryVehicleDetectionPageState
   final FlutterTts _tts = FlutterTts();
 
   // Detection flow state
-  String _currentStep = 'idle';
-  String _statusMessage = 'Tap Start to begin detection';
+  String _currentStep = 'initial_countdown';
+  String _statusMessage = 'Initializing...';
   bool _isProcessing = false;
+
+  // Initial countdown timer
+  int _initialCountdown = 15;
+  Timer? _initialCountdownTimer;
 
   // Stationary detection
   bool _isStationary = false;
   int _stationarySeconds = 0;
   Timer? _stationaryTimer;
   StreamSubscription? _accelerometerSubscription;
-  double _lastAccelX = 0,
-      _lastAccelY = 0,
-      _lastAccelZ = 0;
+  double _lastAccelX = 0, _lastAccelY = 0, _lastAccelZ = 0;
 
   // Plate numbers
   String? _regNo1;
@@ -50,12 +54,15 @@ class _StationaryVehicleDetectionPageState
   // Result
   bool? _testPassed;
 
+  // Result countdown timer
+  int _resultCountdown = 10;
+  Timer? _resultCountdownTimer;
+
   @override
   void initState() {
     super.initState();
     _textRecognizer = TextRecognizer(script: TextRecognitionScript.latin);
-    _requestPermissions();
-    _initCamera();
+    _initializeApp();
   }
 
   @override
@@ -65,22 +72,50 @@ class _StationaryVehicleDetectionPageState
     _textRecognizer.close();
     _stationaryTimer?.cancel();
     _accelerometerSubscription?.cancel();
+    _initialCountdownTimer?.cancel();
+    _resultCountdownTimer?.cancel();
+    _tts.stop();
     super.dispose();
   }
 
-  Future<void> _requestPermissions() async {
-    await [
+  Future<void> _initializeApp() async {
+    // Request permissions FIRST
+    final permissions = await _requestPermissions();
+
+    if (!permissions) {
+      setState(() {
+        _isCameraInitializing = false;
+        _statusMessage = 'Permissions denied. Please grant permissions.';
+      });
+      return;
+    }
+
+    // Wait a bit for permissions to settle
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    // THEN initialize camera
+    await _initCamera();
+  }
+
+  Future<bool> _requestPermissions() async {
+    final statuses = await [
       Permission.camera,
       Permission.microphone,
-      Permission.storage,
     ].request();
+
+    return statuses[Permission.camera]?.isGranted == true;
   }
 
   Future<void> _initCamera() async {
     try {
       _cameras = await availableCameras();
       if (_cameras == null || _cameras!.isEmpty) {
-        setState(() => _isCameraInitializing = false);
+        if (mounted) {
+          setState(() {
+            _isCameraInitializing = false;
+            _statusMessage = 'No camera found';
+          });
+        }
         return;
       }
 
@@ -88,36 +123,86 @@ class _StationaryVehicleDetectionPageState
       _cameraController = CameraController(
         cam,
         ResolutionPreset.high,
-        enableAudio: false, // IMPORTANT: Keep audio disabled for video
+        enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
       await _cameraController!.initialize();
-      if (mounted) setState(() => _isCameraInitializing = false);
+
+      if (mounted) {
+        setState(() => _isCameraInitializing = false);
+        // Start automatic countdown after camera initializes
+        await Future.delayed(const Duration(milliseconds: 500));
+        _startInitialCountdown();
+      }
     } catch (e) {
-      debugPrint('Camera init error: $e');
-      if (mounted) setState(() => _isCameraInitializing = false);
+      debugPrint('❌ Camera init error: $e');
+      if (mounted) {
+        setState(() {
+          _isCameraInitializing = false;
+          _statusMessage = 'Camera initialization failed: $e';
+        });
+      }
     }
   }
+
+  // ============ INITIAL COUNTDOWN (15 SEC) ============
+  void _startInitialCountdown() {
+    setState(() {
+      _currentStep = 'initial_countdown';
+      _statusMessage = 'Detection starting in $_initialCountdown seconds...';
+    });
+
+    _initialCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      setState(() {
+        _initialCountdown--;
+        _statusMessage = 'Detection starting in $_initialCountdown seconds...';
+      });
+
+      if (_initialCountdown <= 0) {
+        timer.cancel();
+        _startStationaryDetection();
+      }
+    });
+  }
+
   // ============ AUDIO METHODS ============
   Future<void> _playSound(String assetName) async {
     try {
       await _audioPlayer.stop();
       await _audioPlayer.setReleaseMode(ReleaseMode.stop);
-      // FIXED: Removed "sounds/" folder - file is directly in assets/
+      await _audioPlayer.setVolume(1.0);
+
+      // Try playing from assets
       await _audioPlayer.play(AssetSource(assetName));
       debugPrint("🔊 Playing sound: $assetName");
+
+      // Wait for sound to complete
+      await Future.delayed(const Duration(milliseconds: 1500));
     } catch (e) {
       debugPrint("❌ Audio error: $e");
+      // If asset fails, try generating a beep tone
+      try {
+        await _audioPlayer.play(AssetSource('$assetName'));
+      } catch (e2) {
+        debugPrint("❌ Audio fallback error: $e2");
+      }
     }
   }
 
   Future<void> _speakInstruction(String instruction) async {
-    debugPrint("🔊 Speaking: $instruction");
-    await _tts.setLanguage("en-IN");
-    await _tts.setSpeechRate(0.9);
-    await _tts.setVolume(1.0);
-    await _tts.speak(instruction);
+    try {
+      debugPrint("🔊 Speaking: $instruction");
+      await _tts.setLanguage("en-IN");
+      await _tts.setSpeechRate(0.9);
+      await _tts.setVolume(1.0);
+      await _tts.speak(instruction);
+
+      // Wait for speech to complete
+      await Future.delayed(Duration(milliseconds: instruction.length * 80));
+    } catch (e) {
+      debugPrint("❌ TTS error: $e");
+    }
   }
 
   // ============ STATIONARY DETECTION ============
@@ -186,9 +271,9 @@ class _StationaryVehicleDetectionPageState
     });
 
     _speakInstruction("Device in stationary mode for 5 seconds");
-    _playSound("vehicleTone.mp3");
+    _playSound("beepSound.mp3");
 
-    Future.delayed(const Duration(seconds: 1), _captureFirstPhoto);
+    Future.delayed(const Duration(seconds: 2), _captureFirstPhoto);
   }
 
   // ============ CAPTURE SEQUENCE ============
@@ -221,13 +306,16 @@ class _StationaryVehicleDetectionPageState
 
       await Future.delayed(const Duration(seconds: 5));
 
+      // FIRST speak, THEN play sound
       await _speakInstruction("Raising alarm");
-      await _playSound("vehicleTone.mp3");
+      await Future.delayed(const Duration(milliseconds: 500));
+      await _playSound("beepSound.mp3");
       await Future.delayed(const Duration(milliseconds: 500));
 
       _captureSecondPhoto();
     } catch (e) {
-      debugPrint("Capture 1 error: $e");
+      debugPrint("❌ Capture 1 error: $e");
+      setState(() => _isProcessing = false);
       _resetTest();
     }
   }
@@ -258,16 +346,16 @@ class _StationaryVehicleDetectionPageState
       });
 
       debugPrint("📸 Photo 2 - Detected: $plateNo");
-      debugPrint("🔍 Matching: $plateNo == $_regNo1");
 
       await Future.delayed(const Duration(seconds: 5));
 
-      await _playSound("vehicleTone.mp3");
+      await _playSound("beepSound.mp3");
       await Future.delayed(const Duration(milliseconds: 500));
 
       await _captureVideo();
     } catch (e) {
-      debugPrint("Capture 2 error: $e");
+      debugPrint("❌ Capture 2 error: $e");
+      setState(() => _isProcessing = false);
       _resetTest();
     }
   }
@@ -281,14 +369,11 @@ class _StationaryVehicleDetectionPageState
     });
 
     try {
-      // FIXED: Start video recording WITHOUT audio
       await _cameraController!.startVideoRecording();
       debugPrint("🎥 Video recording started");
 
-      // Record for 3 seconds
       await Future.delayed(const Duration(seconds: 3));
 
-      // Stop recording
       final videoFile = await _cameraController!.stopVideoRecording();
       debugPrint("🎥 Video saved: ${videoFile.path}");
 
@@ -296,13 +381,11 @@ class _StationaryVehicleDetectionPageState
         _statusMessage = 'Processing video frame...';
       });
 
-      // Take a photo immediately after video to extract plate
       await Future.delayed(const Duration(milliseconds: 500));
 
       final xfile = await _cameraController!.takePicture();
       final bytes = await xfile.readAsBytes();
 
-      // Extract plate number from this frame
       final plateNo = await _extractPlateNumber(bytes);
 
       setState(() {
@@ -315,13 +398,11 @@ class _StationaryVehicleDetectionPageState
 
       debugPrint("🎥 Video frame - Detected: $plateNo");
 
-      // Calculate final result
       await Future.delayed(const Duration(seconds: 1));
       _calculateResult();
     } catch (e) {
       debugPrint("❌ Video capture error: $e");
       setState(() => _isProcessing = false);
-      // Still continue to show result even if video failed
       _calculateResult();
     }
   }
@@ -370,9 +451,7 @@ class _StationaryVehicleDetectionPageState
       final inputImage = InputImage.fromFilePath(tmp.path);
       final recognized = await _textRecognizer.processImage(inputImage);
 
-      if (recognized.text
-          .trim()
-          .isNotEmpty) {
+      if (recognized.text.trim().isNotEmpty) {
         final plateInfo = _findPlateFromRecognized(recognized);
         if (plateInfo != null) {
           return plateInfo;
@@ -393,7 +472,7 @@ class _StationaryVehicleDetectionPageState
 
       return null;
     } catch (e) {
-      debugPrint("OCR error: $e");
+      debugPrint("❌ OCR error: $e");
       return null;
     }
   }
@@ -421,16 +500,14 @@ class _StationaryVehicleDetectionPageState
       final out = img.encodeJpg(gray, quality: 85);
       return Uint8List.fromList(out);
     } catch (e) {
-      debugPrint("Enhance error: $e");
+      debugPrint("❌ Enhance error: $e");
       return null;
     }
   }
 
   Future<io.File> _writeTempImage(Uint8List bytes) async {
     final dir = await io.Directory.systemTemp.createTemp();
-    final file = io.File(p.join(dir.path, 'temp_${DateTime
-        .now()
-        .microsecondsSinceEpoch}.jpg'));
+    final file = io.File(p.join(dir.path, 'temp_${DateTime.now().microsecondsSinceEpoch}.jpg'));
     await file.writeAsBytes(bytes);
     return file;
   }
@@ -486,8 +563,7 @@ class _StationaryVehicleDetectionPageState
         .replaceAllMapped(RegExp(r'(?<=[A-Z])5(?=[A-Z])'), (m) => 'S')
         .replaceAllMapped(RegExp(r'(?<=[A-Z])8(?=[A-Z])'), (m) => 'B');
 
-    final reg = RegExp(
-        r'[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}', caseSensitive: false);
+    final reg = RegExp(r'[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}', caseSensitive: false);
     final m = reg.firstMatch(normalized);
 
     return m?.group(0);
@@ -512,18 +588,37 @@ class _StationaryVehicleDetectionPageState
         ? "Vehicle Number $detectedPlate Matched Successfully!"
         : "Vehicle Number $detectedPlate Did Not Match — Test Failed!";
 
+    _resultCountdown = 10;
+
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (_) =>
-          AlertDialog(
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(24)),
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          _resultCountdownTimer?.cancel();
+          _resultCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+            if (_resultCountdown > 0) {
+              setDialogState(() {
+                _resultCountdown--;
+              });
+            } else {
+              timer.cancel();
+              Navigator.of(dialogContext).pop(); // Close dialog
+              Navigator.of(context).pushAndRemoveUntil(
+                MaterialPageRoute(builder: (context) => const HomeScreen()),
+                    (Route<dynamic> route) => false,
+              );
+            }
+          });
+
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
             backgroundColor: Colors.white,
             contentPadding: EdgeInsets.zero,
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                // 🔷 Header with gradient
                 Container(
                   padding: const EdgeInsets.all(24),
                   decoration: BoxDecoration(
@@ -558,6 +653,8 @@ class _StationaryVehicleDetectionPageState
                     ],
                   ),
                 ),
+
+                // 🔷 Body content
                 Padding(
                   padding: const EdgeInsets.all(24),
                   child: Column(
@@ -567,7 +664,7 @@ class _StationaryVehicleDetectionPageState
                         resultMessage,
                         textAlign: TextAlign.center,
                         style: TextStyle(
-                          fontSize: 16,
+                          fontSize: 24,
                           color: _testPassed == true
                               ? Colors.green[700]
                               : Colors.red[700],
@@ -575,36 +672,53 @@ class _StationaryVehicleDetectionPageState
                         ),
                       ),
                       const SizedBox(height: 20),
-                      _buildResultRow('Photo 1:', _regNo1),
-                      const SizedBox(height: 8),
-                      _buildResultRow('Photo 2:', _regNo2),
-                      const SizedBox(height: 8),
-                      _buildResultRow('Video:', _regNo3),
-                      const SizedBox(height: 24),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: () {
-                            Navigator.of(context).pop();
-                            _resetTest();
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _testPassed == true
-                                ? const Color(0xFF4CAF50)
-                                : const Color(0xFFFF6B6B),
-                            padding: const EdgeInsets.symmetric(vertical: 14),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
+
+                      // ✅ Show mismatch details ONLY if test failed
+                      if (_testPassed != true) ...[
+                        _buildResultRow('Photo 1:', _regNo1),
+                        const SizedBox(height: 8),
+                        _buildResultRow('Photo 2:', _regNo2),
+                        const SizedBox(height: 8),
+                        _buildResultRow('Video:', _regNo3),
+                        const SizedBox(height: 24),
+                      ],
+
+                      // ✅ Countdown timer box
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[200],
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          children: [
+                            Text(
+                              'Returning to home in',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: Colors.grey[700],
+                              ),
                             ),
-                          ),
-                          child: const Text(
-                            'Start New Test',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 16,
+                            const SizedBox(height: 8),
+                            Text(
+                              '$_resultCountdown',
+                              style: TextStyle(
+                                fontSize: 32,
+                                fontWeight: FontWeight.bold,
+                                color: _testPassed == true
+                                    ? const Color(0xFF4CAF50)
+                                    : const Color(0xFFFF6B6B),
+                              ),
                             ),
-                          ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'seconds',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: Colors.grey[700],
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ],
@@ -612,9 +726,12 @@ class _StationaryVehicleDetectionPageState
                 ),
               ],
             ),
-          ),
+          );
+        },
+      ),
     );
   }
+
 
   Widget _buildResultRow(String label, String? value) {
     return Container(
@@ -648,17 +765,19 @@ class _StationaryVehicleDetectionPageState
 
   void _resetTest() {
     setState(() {
-      _currentStep = 'idle';
-      _statusMessage = 'Tap Start to begin detection';
+      _currentStep = 'initial_countdown';
+      _statusMessage = 'Initializing...';
       _regNo1 = null;
       _regNo2 = null;
       _regNo3 = null;
       _testPassed = null;
       _stationarySeconds = 0;
       _isStationary = false;
+      _initialCountdown = 15;
     });
     _stationaryTimer?.cancel();
     _accelerometerSubscription?.cancel();
+    _resultCountdownTimer?.cancel();
   }
 
   @override
@@ -694,10 +813,29 @@ class _StationaryVehicleDetectionPageState
     return Scaffold(
       backgroundColor: Colors.black,
       body: controller == null || !controller.value.isInitialized
-          ? const Center(
-        child: Text(
-          'Camera not available',
-          style: TextStyle(color: Colors.white, fontSize: 18),
+          ? Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(
+              Icons.camera_alt_outlined,
+              color: Colors.white,
+              size: 80,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              _statusMessage,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white, fontSize: 18),
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.pop(context);
+              },
+              child: const Text('Go Back'),
+            ),
+          ],
         ),
       )
           : Stack(
@@ -781,6 +919,17 @@ class _StationaryVehicleDetectionPageState
                       fontWeight: FontWeight.bold,
                     ),
                   ),
+                  if (_currentStep == 'initial_countdown')
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: LinearProgressIndicator(
+                        value: (15 - _initialCountdown) / 15,
+                        backgroundColor: Colors.white30,
+                        valueColor: const AlwaysStoppedAnimation<Color>(
+                          Colors.blue,
+                        ),
+                      ),
+                    ),
                   if (_currentStep == 'waiting_stationary' && _isStationary)
                     Padding(
                       padding: const EdgeInsets.only(top: 12),
@@ -819,36 +968,6 @@ class _StationaryVehicleDetectionPageState
                 ),
               ),
             ),
-          Positioned(
-            bottom: 0,
-            left: 0,
-            right: 0,
-            child: SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: _currentStep == 'idle'
-                    ? ElevatedButton(
-                  onPressed: _startStationaryDetection,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF4CAF50),
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                  ),
-                  child: const Text(
-                    'Start Detection',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                )
-                    : const SizedBox.shrink(),
-              ),
-            ),
-          ),
         ],
       ),
     );
@@ -888,6 +1007,8 @@ class _StationaryVehicleDetectionPageState
 
   Color _getStepColor() {
     switch (_currentStep) {
+      case 'initial_countdown':
+        return Colors.blue;
       case 'waiting_stationary':
         return Colors.orange;
       case 'ready':
